@@ -81,7 +81,7 @@ async function handleImg(request: Request, env: Env): Promise<Response> {
     q: t.q,
     dpr: t.dpr,
     // force format auto always in this system
-    format: 'auto',
+    format: 'avif',
   });
 
   const expected = await hmacHex(env.IMG_SIGNING_SECRET, canonical);
