@@ -57,9 +57,9 @@ async function handleImg(request: Request, env: Env): Promise<Response> {
   if (!key) return new Response('Bad key', { status: 400 });
 
   // Optional hotlink protection (works for normal browsers; crawlers sometimes omit referer)
-  if (!isAllowedReferer(request, env)) {
-    return new Response('Forbidden', { status: 403 });
-  }
+//   if (!isAllowedReferer(request, env)) {
+//     return new Response('Forbidden', { status: 403 });
+//   }
 
   // Verify signature (must be valid)
   const sig = url.searchParams.get('sig') || '';
@@ -221,14 +221,14 @@ function guessContentType(key: string): string {
   return 'image/jpeg';
 }
 
-function isAllowedReferer(request: Request, env: Env): boolean {
-  const list = (env.ALLOWED_REFERER_PREFIXES || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
-  if (list.length === 0) return true;
+// function isAllowedReferer(request: Request, env: Env): boolean {
+//   const list = (env.ALLOWED_REFERER_PREFIXES || '')
+//     .split(',')
+//     .map(s => s.trim())
+//     .filter(Boolean);
+//   if (list.length === 0) return true;
 
-  const ref = request.headers.get('referer');
-  if (!ref) return true; // allow empty referer (some browsers/crawlers)
-  return list.some(prefix => ref.startsWith(prefix));
-}
+//   const ref = request.headers.get('referer');
+//   if (!ref) return true; // allow empty referer (some browsers/crawlers)
+//   return list.some(prefix => ref.startsWith(prefix));
+// }
