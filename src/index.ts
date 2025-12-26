@@ -94,13 +94,13 @@ async function handleImg(request: Request, env: Env): Promise<Response> {
 	// Fetch original through /raw (internal), then apply Cloudflare Image Resizing
 	const rawUrl = new URL(`/raw/${encodeURIComponent(key)}`, url.origin);
 
-	const imageRequest = new Request(rawUrl, {
+	const rawImageRequest = new Request(rawUrl, {
 		headers: {
 			'x-internal-raw-token': env.INTERNAL_RAW_TOKEN,
 		},
 	});
 
-	const resized = await fetch(imageRequest, {
+	const resized = await fetch(rawImageRequest, {
 		cf: {
 			image: {
 				width: t.w ?? undefined,
