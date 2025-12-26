@@ -17,7 +17,7 @@ export default {
 			return handleImg(request, env);
 		}
 
-		return new Response('Not found', { status: 404 });
+		return new Response('Not found', { status: 404, statusText: 'Not found' });
 	},
 };
 
@@ -27,7 +27,7 @@ async function handleRaw(request: Request, env: Env): Promise<Response> {
 	const token = request.headers.get('x-internal-raw-token');
 
 	if (!token || token !== env.INTERNAL_RAW_TOKEN) {
-		return new Response('Forbidden', { status: 403 });
+		return new Response('Forbidden', { status: 403, statusText: 'Forbidden' });
 	}
 
 	const url = new URL(request.url);
@@ -55,7 +55,8 @@ async function handleImg(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
 
 	const key = safeKey(url.pathname.slice('/transform/'.length));
-	if (!key) return new Response('Bad key', { status: 400 });
+
+	if (!key) return new Response('Bad key', { status: 400, statusText: `Bad key ${key}` });
 
 	// Optional hotlink protection (works for normal browsers; crawlers sometimes omit referer)
 	//   if (!isAllowedReferer(request, env)) {
@@ -67,7 +68,7 @@ async function handleImg(request: Request, env: Env): Promise<Response> {
 	const exp = parseInt(url.searchParams.get('exp') || '0', 10);
 
 	if (!exp || exp < Math.floor(Date.now() / 1000)) {
-		return new Response('URL expired', { status: 401 });
+		return new Response('URL expired', { status: 401, statusText: 'URL expired' });
 	}
 
 	// Normalize transform params using allowlists (do NOT sign random params)
@@ -88,7 +89,7 @@ async function handleImg(request: Request, env: Env): Promise<Response> {
 	const expected = await hmacHex(env.IMG_SIGNING_SECRET, canonical);
 
 	if (!timingSafeEqual(sig, expected)) {
-		return new Response('Bad signature', { status: 401 });
+		return new Response('Bad signature', { status: 401, statusText: 'Bad signature' });
 	}
 
 	// Fetch original through /raw (internal), then apply Cloudflare Image Resizing
