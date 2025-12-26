@@ -131,7 +131,7 @@ function safeKey(key: string): string | null {
   if (!k) return null;
   if (k.includes('..')) return null;
   // You can tighten more: only allow v1/... and only image extensions
-  if (!k.startsWith('v1/')) return null;
+  // if (!k.startsWith('v1/')) return null;
   if (!/\.(jpg|jpeg|png|webp|avif)$/i.test(k)) return null;
   return k;
 }
