@@ -1,8 +1,8 @@
 const ALLOWED_WIDTHS = new Set([320, 480, 640, 768, 960, 1280, 1600, 1920, 2560]);
 const MAX_DPR = 2;
 
-const ALLOWED_FIT = new Set(['cover', 'contain', 'scale-down', 'fill', 'inside', 'outside']);
-type Fit = 'cover' | 'contain' | 'scale-down' | 'fill' | 'inside' | 'outside';
+const ALLOWED_FIT = new Set(['cover', 'contain', 'scale-down', 'crop', 'pad', 'squeeze']);
+type Fit = 'cover' | 'contain' | 'scale-down' | 'crop' | 'pad' | 'squeeze';
 
 // ---------- Entry ----------
 export default {
@@ -13,7 +13,7 @@ export default {
       return handleRaw(request, env);
     }
 
-    if (url.pathname.startsWith('/img/')) {
+    if (url.pathname.startsWith('/transform/')) {
       return handleImg(request, env);
     }
 
@@ -49,11 +49,11 @@ async function handleRaw(request: Request, env: Env): Promise<Response> {
   return new Response(obj.body, { headers });
 }
 
-// ---------- /img: signed + resized ----------
+// ---------- /transform: signed + resized ----------
 async function handleImg(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
-  const key = safeKey(url.pathname.slice('/img/'.length));
+  const key = safeKey(url.pathname.slice('/transform/'.length));
   if (!key) return new Response('Bad key', { status: 400 });
 
   // Optional hotlink protection (works for normal browsers; crawlers sometimes omit referer)
@@ -94,21 +94,21 @@ async function handleImg(request: Request, env: Env): Promise<Response> {
   const rawUrl = new URL(`/raw/${encodeURIComponent(key)}`, url.origin);
 
   const resized = await fetch(rawUrl.toString(), {
-    headers: {
-      'x-internal-raw-token': env.INTERNAL_RAW_TOKEN,
-    },
-    cf: {
-      image: {
-        width: t.w ?? undefined,
-        height: t.h ?? undefined,
-        fit: t.fit,
-        quality: t.q,
-        dpr: t.dpr,
-        format: 'auto',
-        metadata: 'none',
-      },
-    } as any,
-  });
+		headers: {
+			'x-internal-raw-token': env.INTERNAL_RAW_TOKEN,
+		},
+		cf: {
+			image: {
+				width: t.w ?? undefined,
+				height: t.h ?? undefined,
+				fit: t.fit,
+				quality: t.q,
+				dpr: t.dpr,
+				format: 'avif',
+				metadata: 'none',
+			},
+		},
+	});
 
   if (!resized.ok) {
     // Pass through origin errors (useful during debugging)
