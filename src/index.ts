@@ -1,12 +1,16 @@
-const ALLOWED_WIDTHS = new Set([320, 480, 640, 768, 960, 1280, 1600, 1920, 2560]);
-const MAX_DPR = 2;
+import { isNumericString } from './helpers';
 
+const ALLOWED_WIDTHS = new Set([320, 480, 640, 768, 960, 1280, 1600, 1920, 2560]);
 const ALLOWED_FIT = new Set(['cover', 'contain', 'scale-down', 'crop', 'pad', 'squeeze']);
-type Fit = 'cover' | 'contain' | 'scale-down' | 'crop' | 'pad' | 'squeeze';
+const ALLOWED_METADATA = new Set(['keep', 'copyright', 'none']);
+const ALLOWED_GRAVITY = new Set(['face', 'left', 'right', 'top', 'bottom', 'center', 'auto', 'entropy']);
+const ALLOWED_QUALITY = new Set(['low', 'medium-low', 'medium-high', 'high']);
+const ALLOWED_FORMAT = new Set(['avif', 'webp', 'json', 'jpeg', 'png', 'baseline-jpeg', 'png-force', 'svg']);
+const MAX_DPR = 2;
 
 // ---------- Entry ----------
 export default {
-	async fetch(request: Request, env: Env): Promise<Response> {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 
 		if (url.pathname.startsWith('/raw/')) {
@@ -14,27 +18,30 @@ export default {
 		}
 
 		if (url.pathname.startsWith('/transform/')) {
-			return handleImg(request, env);
+			return handleImg(request, env, ctx);
 		}
 
-		return new Response('Not found', { status: 404, statusText: 'Not found' });
+		return new Response('Not found', { status: 404 });
 	},
 };
 
 // ---------- /raw: serve original (private) ----------
 async function handleRaw(request: Request, env: Env): Promise<Response> {
+	const url = new URL(request.url);
+
 	// ONLY allow internal access from our own Worker subrequest
-	const token = request.headers.get('x-internal-raw-token');
+	const token = url.searchParams.get('token');
 
 	if (!token || token !== env.INTERNAL_RAW_TOKEN) {
-		return new Response('Forbidden', { status: 403, statusText: 'Forbidden' });
+		return new Response('Forbidden', { status: 403 });
 	}
 
-	const url = new URL(request.url);
 	const key = safeKey(url.pathname.slice('/raw/'.length));
+
 	if (!key) return new Response('Bad key', { status: 400 });
 
-	const obj = await env.R2_BUCKET.get(key);
+	const obj = await env.R2_BUCKET.get(key.slice(1)); // remove prefix slash
+
 	if (!obj) return new Response('Not found', { status: 404 });
 
 	const headers = new Headers();
@@ -51,24 +58,26 @@ async function handleRaw(request: Request, env: Env): Promise<Response> {
 }
 
 // ---------- /transform: signed + resized ----------
-async function handleImg(request: Request, env: Env): Promise<Response> {
+async function handleImg(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	let cache = caches.default;
+	await cache.match(request);
 	const url = new URL(request.url);
 
 	const key = safeKey(url.pathname.slice('/transform/'.length));
 
-	if (!key) return new Response('Bad key', { status: 400, statusText: `Bad key ${key}` });
+	if (!key) return new Response('Bad key', { status: 400 });
 
 	// Optional hotlink protection (works for normal browsers; crawlers sometimes omit referer)
-	//   if (!isAllowedReferer(request, env)) {
-	//     return new Response('Forbidden', { status: 403 });
-	//   }
+	if (!isAllowedReferer(request, env)) {
+		return new Response('Forbidden', { status: 403 });
+	}
 
 	// Verify signature (must be valid)
 	const sig = url.searchParams.get('sig') || '';
 	const exp = parseInt(url.searchParams.get('exp') || '0', 10);
 
 	if (!exp || exp < Math.floor(Date.now() / 1000)) {
-		return new Response('URL expired', { status: 401, statusText: 'URL expired' });
+		return new Response('URL expired', { status: 401 });
 	}
 
 	// Normalize transform params using allowlists (do NOT sign random params)
@@ -83,34 +92,44 @@ async function handleImg(request: Request, env: Env): Promise<Response> {
 		q: t.q,
 		dpr: t.dpr,
 		// force format auto always in this system
-		format: 'avif',
+		format: t.format,
+		gravity: t.gravity,
+		metadata: t.metadata,
+		sharpen: t.sharpen,
 	});
 
 	const expected = await hmacHex(env.IMG_SIGNING_SECRET, canonical);
 
 	if (!timingSafeEqual(sig, expected)) {
-		return new Response('Bad signature', { status: 401, statusText: 'Bad signature' });
+		return new Response('Bad signature', { status: 401 });
 	}
 
+	// Cache transformed image aggressively at edge:
+	// immutable is safe because key includes hash/immutable path, OR you sign per asset change.
+	// Also include Vary: Accept for format auto.
+	const cacheKey = new Request(url.toString(), request);
+	const cached = await caches.default.match(cacheKey);
+	if (cached) return cached;
+	
 	// Fetch original through /raw (internal), then apply Cloudflare Image Resizing
 	const rawUrl = new URL(`/raw/${encodeURIComponent(key)}`, url.origin);
 
-	const rawImageRequest = new Request(rawUrl, {
-		headers: {
-			'x-internal-raw-token': env.INTERNAL_RAW_TOKEN,
-		},
-	});
+	rawUrl.searchParams.set('token', env.INTERNAL_RAW_TOKEN);
+
+	const rawImageRequest = new Request(rawUrl);
 
 	const resized = await fetch(rawImageRequest, {
 		cf: {
 			image: {
 				width: t.w ?? undefined,
 				height: t.h ?? undefined,
-				fit: t.fit,
-				quality: t.q,
+				fit: t.fit as RequestInitCfPropertiesImage['fit'],
+				quality: t.q as RequestInitCfPropertiesImage['quality'],
 				dpr: t.dpr,
-				format: 'avif',
-				metadata: 'none',
+				format: t.format as RequestInitCfPropertiesImage['format'],
+				metadata: t.metadata as RequestInitCfPropertiesImage['metadata'],
+				gravity: t.gravity as RequestInitCfPropertiesImage['gravity'],
+				sharpen: t.sharpen,
 			},
 		},
 	});
@@ -127,6 +146,7 @@ async function handleImg(request: Request, env: Env): Promise<Response> {
 	// Optional: lock down sniffing
 	out.headers.set('X-Content-Type-Options', 'nosniff');
 
+	ctx.waitUntil(caches.default.put(cacheKey, out.clone()));
 	return out;
 }
 
@@ -144,9 +164,13 @@ function safeKey(key: string): string | null {
 function normalizeTransform(sp: URLSearchParams): {
 	w: number | null;
 	h: number | null;
-	q: number;
-	fit: Fit;
+	q: number | string;
+	fit: string;
 	dpr: number;
+	format: string;
+	metadata: string;
+	gravity?: string;
+	sharpen?: number;
 } {
 	const wRaw = parseInt(sp.get('w') || '0', 10);
 	const hRaw = parseInt(sp.get('h') || '0', 10);
@@ -155,18 +179,38 @@ function normalizeTransform(sp: URLSearchParams): {
 	const h = ALLOWED_WIDTHS.has(hRaw) ? hRaw : null;
 
 	// quality clamp
-	const qRaw = parseInt(sp.get('q') || '80', 10);
-	const q = Math.max(40, Math.min(90, Number.isFinite(qRaw) ? qRaw : 80));
+	let q: string | number = sp.get('q') ?? 85;
+
+	if (isNumericString(q)) {
+		q = parseInt(sp.get('q')!, 10);
+	} else {
+		if (typeof q === 'string' && !ALLOWED_QUALITY.has(q)) {
+			q = 85;
+		}
+	}
 
 	const fitRaw = (sp.get('fit') || 'cover').toLowerCase();
-	const fit = (ALLOWED_FIT.has(fitRaw) ? fitRaw : 'cover') as Fit;
+	const fit = (ALLOWED_FIT.has(fitRaw) ? fitRaw : 'cover');
 
 	const dprRaw = parseFloat(sp.get('dpr') || '1');
 	const dpr = Math.max(1, Math.min(MAX_DPR, Number.isFinite(dprRaw) ? dprRaw : 1));
 
 	// If neither w nor h provided, force a sane default width
 	const finalW = w ?? 960;
-	return { w: finalW, h, q, fit, dpr };
+
+	let format = 'avif';
+
+	if (sp.get('format') && ALLOWED_FORMAT.has(sp.get('format')!)) {
+		format = sp.get('format')!;
+	}
+
+	const sharpen = sp.get('sharpen') ? parseInt(sp.get('sharpen')!, 10) : undefined;
+
+	const metadata = sp.get('metadata') && ALLOWED_METADATA.has(sp.get('metadata')!) ? sp.get('metadata')! : 'none';
+
+	const gravity = sp.get('gravity') && ALLOWED_GRAVITY.has(sp.get('gravity')!) ? sp.get('gravity')! : undefined;
+
+	return { w: finalW, h, q, fit, dpr, format, sharpen, metadata, gravity };
 }
 
 function canonicalString(input: {
@@ -175,12 +219,15 @@ function canonicalString(input: {
 	w: number | null;
 	h: number | null;
 	fit: string;
-	q: number;
+	q: number | string;
 	dpr: number;
 	format: string;
+	metadata: string;
+	gravity?: string;
+	sharpen?: number;
 }) {
 	// Canonical order matters
-	return [
+	const canonicalString = [
 		`key=${input.key}`,
 		`exp=${input.exp}`,
 		`w=${input.w ?? ''}`,
@@ -189,7 +236,18 @@ function canonicalString(input: {
 		`q=${input.q}`,
 		`dpr=${input.dpr}`,
 		`format=${input.format}`,
-	].join('&');
+		`metadata=${input.metadata}`,
+	];
+
+	if (input.gravity) {
+		canonicalString.push(`gravity=${input.gravity}`);
+	}
+
+	if (input.sharpen) {
+		canonicalString.push(`sharpen=${input.sharpen}`);
+	}
+
+	return canonicalString.join('&');
 }
 
 async function hmacHex(secret: string, message: string): Promise<string> {
@@ -220,14 +278,14 @@ function guessContentType(key: string): string {
 	return 'image/jpeg';
 }
 
-// function isAllowedReferer(request: Request, env: Env): boolean {
-//   const list = (env.ALLOWED_REFERER_PREFIXES || '')
-//     .split(',')
-//     .map(s => s.trim())
-//     .filter(Boolean);
-//   if (list.length === 0) return true;
+function isAllowedReferer(request: Request, env: Env): boolean {
+  const list = (env.ALLOWED_REFERER_PREFIXES || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  if (list.length === 0) return true;
 
-//   const ref = request.headers.get('referer');
-//   if (!ref) return true; // allow empty referer (some browsers/crawlers)
-//   return list.some(prefix => ref.startsWith(prefix));
-// }
+  const ref = request.headers.get('referer');
+  if (!ref) return true; // allow empty referer (some browsers/crawlers)
+  return list.some(prefix => ref.startsWith(prefix));
+}

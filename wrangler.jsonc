@@ -14,7 +14,7 @@
 	"r2_buckets": [
 		{
 			"binding": "R2_BUCKET",
-			"bucket_name": "lord-of-trees-images"
+			"bucket_name": "lord-of-trees-images",
 		}
 	]
 	/**
