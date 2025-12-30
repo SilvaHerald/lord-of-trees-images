@@ -29,50 +29,56 @@ export default {
 async function handleRaw(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
 
-	// ONLY allow internal access from our own Worker subrequest
-	const token = url.searchParams.get('token');
+	const key = safeKey(url.pathname.slice('/raw/'.length));
+	if (!key) return new Response('Bad key', { status: 400 });
 
-	if (!token || token !== env.INTERNAL_RAW_TOKEN) {
+	// ✅ short-lived signature instead of static token
+	const exp = parseInt(url.searchParams.get('exp') || '0', 10);
+	const sig = url.searchParams.get('sig') || '';
+
+	if (!exp || exp < Math.floor(Date.now() / 1000)) {
+		return new Response('URL expired', { status: 401 });
+	}
+
+	const canonical = `raw|key=${key}|exp=${exp}`;
+	const expected = await hmacHex(env.INTERNAL_RAW_TOKEN, canonical);
+
+	if (!timingSafeEqual(sig, expected)) {
 		return new Response('Forbidden', { status: 403 });
 	}
 
-	const key = safeKey(url.pathname.slice('/raw/'.length));
+	// Your safeKey() apparently returns something like "/v1/..."
+	// You currently do key.slice(1) to remove the leading slash.
+	const r2Key = key.startsWith('/') ? key.slice(1) : key;
 
-	if (!key) return new Response('Bad key', { status: 400 });
-
-	const obj = await env.R2_BUCKET.get(key.slice(1)); // remove prefix slash
-
+	const obj = await env.R2_BUCKET.get(r2Key);
 	if (!obj) return new Response('Not found', { status: 404 });
 
 	const headers = new Headers();
 	obj.writeHttpMetadata(headers);
 
-	// Strong caching for originals at edge is fine because they are not public-facing.
-	// But we’ll keep it short just in case.
+	// private + short cache; raw URLs are short-lived anyway
 	headers.set('Cache-Control', 'private, max-age=300');
-
-	// If missing, best-effort content type
 	if (!headers.get('Content-Type')) headers.set('Content-Type', guessContentType(key));
 
 	return new Response(obj.body, { headers });
 }
 
+
 // ---------- /transform: signed + resized ----------
 async function handleImg(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-	let cache = caches.default;
-	await cache.match(request);
 	const url = new URL(request.url);
 
+	// 1) Parse + validate key
 	const key = safeKey(url.pathname.slice('/transform/'.length));
-
 	if (!key) return new Response('Bad key', { status: 400 });
 
-	// Optional hotlink protection (works for normal browsers; crawlers sometimes omit referer)
+	// 2) Optional hotlink protection
 	if (!isAllowedReferer(request, env)) {
 		return new Response('Forbidden', { status: 403 });
 	}
 
-	// Verify signature (must be valid)
+	// 3) Verify signature (public signed URL)
 	const sig = url.searchParams.get('sig') || '';
 	const exp = parseInt(url.searchParams.get('exp') || '0', 10);
 
@@ -80,7 +86,7 @@ async function handleImg(request: Request, env: Env, ctx: ExecutionContext): Pro
 		return new Response('URL expired', { status: 401 });
 	}
 
-	// Normalize transform params using allowlists (do NOT sign random params)
+	// Normalize transform params using allowlists (this MUST match what you sign)
 	const t = normalizeTransform(url.searchParams);
 
 	const canonical = canonicalString({
@@ -91,7 +97,6 @@ async function handleImg(request: Request, env: Env, ctx: ExecutionContext): Pro
 		fit: t.fit,
 		q: t.q,
 		dpr: t.dpr,
-		// force format auto always in this system
 		format: t.format,
 		gravity: t.gravity,
 		metadata: t.metadata,
@@ -104,21 +109,53 @@ async function handleImg(request: Request, env: Env, ctx: ExecutionContext): Pro
 		return new Response('Bad signature', { status: 401 });
 	}
 
-	// Cache transformed image aggressively at edge:
-	// immutable is safe because key includes hash/immutable path, OR you sign per asset change.
-	// Also include Vary: Accept for format auto.
-	const cacheKey = new Request(url.toString(), request);
+	// 4) ✅ Normalized cache key (ignore sig/exp so cache hit stays high)
+	const cacheUrl = new URL(url.toString());
+	cacheUrl.searchParams.delete('sig');
+	cacheUrl.searchParams.delete('exp');
+
+	// Make cache key deterministic from normalized params
+	if (t.w != null) cacheUrl.searchParams.set('w', String(t.w));
+	else cacheUrl.searchParams.delete('w');
+
+	if (t.h != null) cacheUrl.searchParams.set('h', String(t.h));
+	else cacheUrl.searchParams.delete('h');
+
+	cacheUrl.searchParams.set('fit', String(t.fit));
+	cacheUrl.searchParams.set('q', String(t.q));
+	cacheUrl.searchParams.set('dpr', String(t.dpr));
+	cacheUrl.searchParams.set('format', String(t.format));
+
+	if (t.gravity) cacheUrl.searchParams.set('gravity', String(t.gravity));
+	else cacheUrl.searchParams.delete('gravity');
+
+	if (t.metadata) cacheUrl.searchParams.set('metadata', String(t.metadata));
+	else cacheUrl.searchParams.delete('metadata');
+
+	if (typeof t.sharpen === 'number') cacheUrl.searchParams.set('sharpen', String(t.sharpen));
+	else cacheUrl.searchParams.delete('sharpen');
+
+	// Vary by Accept for format=auto (avif/webp/jpeg)
+	const accept = request.headers.get('Accept') ?? '';
+	const cacheKey = new Request(cacheUrl.toString(), {
+		method: 'GET',
+		headers: { Accept: accept },
+	});
+
 	const cached = await caches.default.match(cacheKey);
 	if (cached) return cached;
-	
-	// Fetch original through /raw (internal), then apply Cloudflare Image Resizing
+
+	// 5) ✅ Fetch original through /raw using SHORT-LIVED signed URL (no static token)
 	const rawUrl = new URL(`/raw/${encodeURIComponent(key)}`, url.origin);
 
-	rawUrl.searchParams.set('token', env.INTERNAL_RAW_TOKEN);
+	const rawExp = Math.floor(Date.now() / 1000) + 60; // 60s is enough for an internal fetch
+	const rawCanonical = `raw|key=${key}|exp=${rawExp}`;
+	const rawSig = await hmacHex(env.INTERNAL_RAW_TOKEN, rawCanonical);
 
-	const rawImageRequest = new Request(rawUrl);
+	rawUrl.searchParams.set('exp', String(rawExp));
+	rawUrl.searchParams.set('sig', rawSig);
 
-	const resized = await fetch(rawImageRequest, {
+	const resized = await fetch(rawUrl.toString(), {
 		cf: {
 			image: {
 				width: t.w ?? undefined,
@@ -135,20 +172,20 @@ async function handleImg(request: Request, env: Env, ctx: ExecutionContext): Pro
 	});
 
 	if (!resized.ok) {
-		// Pass through origin errors (useful during debugging)
 		return new Response(`Resize failed: ${resized.status}`, { status: resized.status });
 	}
 
+	// 6) Output headers + edge cache
 	const out = new Response(resized.body, resized);
 	out.headers.set('Cache-Control', 'public, max-age=31536000, immutable');
 	out.headers.set('Vary', 'Accept');
-
-	// Optional: lock down sniffing
 	out.headers.set('X-Content-Type-Options', 'nosniff');
 
 	ctx.waitUntil(caches.default.put(cacheKey, out.clone()));
 	return out;
 }
+
+
 
 // ---------- Helpers ----------
 function safeKey(key: string): string | null {
@@ -285,7 +322,12 @@ function isAllowedReferer(request: Request, env: Env): boolean {
     .filter(Boolean);
   if (list.length === 0) return true;
 
-  const ref = request.headers.get('referer');
-  if (!ref) return true; // allow empty referer (some browsers/crawlers)
-  return list.some(prefix => ref.startsWith(prefix));
+	const referer = request.headers.get('referer');
+	const origin = request.headers.get('origin');
+
+	if (origin) return list.some(item => origin === item)
+
+	if (referer) return list.some((item) => referer.startsWith(item));
+
+	return false;
 }
