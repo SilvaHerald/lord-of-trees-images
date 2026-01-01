@@ -8,6 +8,87 @@ const ALLOWED_QUALITY = new Set(['low', 'medium-low', 'medium-high', 'high']);
 const ALLOWED_FORMAT = new Set(['avif', 'webp', 'json', 'jpeg', 'png', 'baseline-jpeg', 'png-force', 'svg']);
 const MAX_DPR = 2;
 
+// ---------- Helpers ----------
+function corsHeaders(req: Request, env: Env) {
+	const origin = req.headers.get('Origin');
+
+	const allowedList = (env.ALLOWED_ORIGIN_LIST || '')
+		.split(',')
+		.map((i) => i.trim())
+		.filter(Boolean);
+
+	if (allowedList.length === 0 || allowedList.some((item) => origin === item)) {
+		return {
+			'Access-Control-Allow-Origin': origin,
+			'Access-Control-Allow-Credentials': true,
+			Vary: 'Origin',
+		};
+	}
+
+	return {} as Record<string, any>;
+}
+
+function requireSiteOrigin(req: Request, env: Env) {
+	const origin = req.headers.get('Origin');
+	const referer = req.headers.get('Referer');
+
+	const allowedList = (env.ALLOWED_ORIGIN_LIST || '')
+		.split(',')
+		.map((i) => i.trim())
+		.filter(Boolean);
+
+	if (allowedList.length === 0) return true;
+
+	// Prefer Origin when present (most browsers)
+	if (origin) return allowedList.some((item) => origin === item);
+
+	// Fallback: some requests may omit Origin; use Referer as a secondary signal
+	if (referer) return allowedList.some((item) => referer.startsWith(item));
+
+	// If neither exists, treat as non-browser / suspicious
+	return false;
+}
+
+function preflight(req: Request, env: Env) {
+	return new Response(null, {
+		status: 204,
+		headers: {
+			...corsHeaders(req, env),
+			'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+			'Access-Control-Allow-Headers': 'content-type',
+			'Access-Control-Max-Age': '86400',
+		},
+	});
+}
+
+function withCors(req: Request, env: Env, res: Response): Response {
+	const headers = new Headers(res.headers);
+	const cors = corsHeaders(req, env);
+
+	for (const [k, v] of Object.entries(cors)) headers.set(k, v);
+
+	// Merge Vary safely
+	const existingVary = headers.get('Vary');
+	const wantVary = new Set<string>();
+
+	if (existingVary) {
+		existingVary
+			.split(',')
+			.map((v) => v.trim())
+			.filter(Boolean)
+			.forEach((v) => wantVary.add(v));
+	}
+
+	// If we allow an Origin, we should vary by Origin
+	if (cors['Access-Control-Allow-Origin']) wantVary.add('Origin');
+
+	wantVary.add('Accept-Encoding');
+
+	headers.set('Vary', Array.from(wantVary).join(', '));
+
+	return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
 // ---------- Entry ----------
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -16,12 +97,11 @@ export default {
 		if (url.pathname.startsWith('/raw/')) {
 			return handleRaw(request, env);
 		}
-
 		if (url.pathname.startsWith('/transform/')) {
 			return handleImg(request, env, ctx);
 		}
 
-		return new Response('Not found', { status: 404 });
+		return withCors(request, env, new Response('Not found', { status: 404 }));
 	},
 };
 
@@ -64,54 +144,62 @@ async function handleRaw(request: Request, env: Env): Promise<Response> {
 	return new Response(obj.body, { headers });
 }
 
-
 // ---------- /transform: signed + resized ----------
 async function handleImg(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	// if (request.method === 'OPTIONS') {
+	// 	return preflight(request, env);
+	// }
+
+	// if (!requireSiteOrigin(request, env)) {
+	// 	return withCors(request, env, new Response('Forbidden', { status: 403 }));
+	// }
+
 	const url = new URL(request.url);
 
 	// 1) Parse + validate key
 	const key = safeKey(url.pathname.slice('/transform/'.length));
-	if (!key) return new Response('Bad key', { status: 400 });
+
+	if (!key) return withCors(request, env, new Response('Bad key', { status: 400 }));
 
 	// 2) Optional hotlink protection
-	if (!isAllowedReferer(request, env)) {
-		return new Response('Forbidden', { status: 403 });
-	}
+	// if (!isAllowedReferer(request, env)) {
+	// 	return new Response('Forbidden', { status: 403 });
+	// }
 
 	// 3) Verify signature (public signed URL)
-	const sig = url.searchParams.get('sig') || '';
+	// const sig = url.searchParams.get('sig') || '';
 	const exp = parseInt(url.searchParams.get('exp') || '0', 10);
 
 	if (!exp || exp < Math.floor(Date.now() / 1000)) {
-		return new Response('URL expired', { status: 401 });
+		return withCors(request, env, new Response('URL expired', { status: 401 }));
 	}
 
 	// Normalize transform params using allowlists (this MUST match what you sign)
 	const t = normalizeTransform(url.searchParams);
 
-	const canonical = canonicalString({
-		key,
-		exp,
-		w: t.w,
-		h: t.h,
-		fit: t.fit,
-		q: t.q,
-		dpr: t.dpr,
-		format: t.format,
-		gravity: t.gravity,
-		metadata: t.metadata,
-		sharpen: t.sharpen,
-	});
+	// const canonical = canonicalString({
+	// 	key,
+	// 	exp,
+	// 	w: t.w,
+	// 	h: t.h,
+	// 	fit: t.fit,
+	// 	q: t.q,
+	// 	dpr: t.dpr,
+	// 	format: t.format,
+	// 	gravity: t.gravity,
+	// 	metadata: t.metadata,
+	// 	sharpen: t.sharpen,
+	// });
 
-	const expected = await hmacHex(env.IMG_SIGNING_SECRET, canonical);
+	// const expected = await hmacHex(env.IMG_SIGNING_SECRET, canonical);
 
-	if (!timingSafeEqual(sig, expected)) {
-		return new Response('Bad signature', { status: 401 });
-	}
+	// if (!timingSafeEqual(sig, expected)) {
+	// 	return withCors(request, env, new Response('Bad signature', { status: 401 }));
+	// }
 
 	// 4) ✅ Normalized cache key (ignore sig/exp so cache hit stays high)
 	const cacheUrl = new URL(url.toString());
-	cacheUrl.searchParams.delete('sig');
+	// cacheUrl.searchParams.delete('sig');
 	cacheUrl.searchParams.delete('exp');
 
 	// Make cache key deterministic from normalized params
@@ -137,13 +225,14 @@ async function handleImg(request: Request, env: Env, ctx: ExecutionContext): Pro
 
 	// Vary by Accept for format=auto (avif/webp/jpeg)
 	const accept = request.headers.get('Accept') ?? '';
+
 	const cacheKey = new Request(cacheUrl.toString(), {
 		method: 'GET',
 		headers: { Accept: accept },
 	});
 
 	const cached = await caches.default.match(cacheKey);
-	if (cached) return cached;
+	if (cached) return withCors(request, env, cached);
 
 	// 5) ✅ Fetch original through /raw using SHORT-LIVED signed URL (no static token)
 	const rawUrl = new URL(`/raw/${encodeURIComponent(key)}`, url.origin);
@@ -172,7 +261,7 @@ async function handleImg(request: Request, env: Env, ctx: ExecutionContext): Pro
 	});
 
 	if (!resized.ok) {
-		return new Response(`Resize failed: ${resized.status}`, { status: resized.status });
+		return withCors(request, env, new Response(`Resize failed: ${resized.status}`, { status: resized.status }));
 	}
 
 	// 6) Output headers + edge cache
@@ -182,10 +271,8 @@ async function handleImg(request: Request, env: Env, ctx: ExecutionContext): Pro
 	out.headers.set('X-Content-Type-Options', 'nosniff');
 
 	ctx.waitUntil(caches.default.put(cacheKey, out.clone()));
-	return out;
+	return withCors(request, env, out);
 }
-
-
 
 // ---------- Helpers ----------
 function safeKey(key: string): string | null {
@@ -227,7 +314,7 @@ function normalizeTransform(sp: URLSearchParams): {
 	}
 
 	const fitRaw = (sp.get('fit') || 'cover').toLowerCase();
-	const fit = (ALLOWED_FIT.has(fitRaw) ? fitRaw : 'cover');
+	const fit = ALLOWED_FIT.has(fitRaw) ? fitRaw : 'cover';
 
 	const dprRaw = parseFloat(sp.get('dpr') || '1');
 	const dpr = Math.max(1, Math.min(MAX_DPR, Number.isFinite(dprRaw) ? dprRaw : 1));
@@ -315,19 +402,19 @@ function guessContentType(key: string): string {
 	return 'image/jpeg';
 }
 
-function isAllowedReferer(request: Request, env: Env): boolean {
-  const list = (env.ALLOWED_REFERER_PREFIXES || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
-  if (list.length === 0) return true;
+// function isAllowedReferer(request: Request, env: Env): boolean {
+// 	const list = (env.ALLOWED_REFERER_PREFIXES || '')
+// 		.split(',')
+// 		.map((s) => s.trim())
+// 		.filter(Boolean);
+// 	if (list.length === 0) return true;
 
-	const referer = request.headers.get('referer');
-	const origin = request.headers.get('origin');
+// 	const referer = request.headers.get('referer');
+// 	const origin = request.headers.get('origin');
 
-	if (origin) return list.some(item => origin === item)
+// 	if (origin) return list.some((item) => origin === item);
 
-	if (referer) return list.some((item) => referer.startsWith(item));
+// 	if (referer) return list.some((item) => referer.startsWith(item));
 
-	return false;
-}
+// 	return false;
+// }
